@@ -1363,6 +1363,14 @@ def backfill_session_titles(config_dir: Path, limit: int = 500) -> int:
     rather than declaring it done — the same direction
     ``analytics.backfill``'s rollup frontier takes when a day fails.
 
+    Cost, stated rather than elided: the FIRST pass after this change, and the
+    first pass on a store whose frontier has been deleted, pays what the old
+    walk paid (measured 196.6-225.4 ms CPU against the old sweep's 268.7 ms on
+    the fixture, the difference being the answer check moved in front of the
+    transcript stat). Every pass after it costs one stat per directory plus one
+    ~60-byte atomic write of the frontier itself — measured 45.1 ms CPU and
+    11,548 syscalls for 11,546 directories, against 268.7 ms and 22,815.
+
     The stamp is the pass's own START, read before the first directory: a
     session created while the pass is walking must be re-probed by the next one,
     and a stamp taken at the END would claim it. A stamp from the FUTURE (the

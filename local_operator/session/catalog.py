@@ -993,7 +993,9 @@ def _memoized_birth(sessions: Path, session_id: str) -> float:
     return born
 
 
-def _row_stat_key(session_dir: Path) -> tuple[float, int] | None:
+def _row_stat_key(
+    session_dir: Path, known: os.stat_result | None = None
+) -> tuple[float, int] | None:
     """``(activity_mtime, size)`` for the transcript, or ``None`` if unreadable.
 
     Deliberately the same file :func:`session.retention.session_activity`
@@ -1001,7 +1003,27 @@ def _row_stat_key(session_dir: Path) -> tuple[float, int] | None:
     been appended to — which is exactly the condition under which its name and
     fork mark cannot have changed. Size is carried alongside mtime because a
     coarse filesystem timestamp can hide an append inside the same second.
+
+    ``known`` is the stat the SCAN already took of this same file
+    (``resume._scan_sessions``'s third return value). The clock stats the
+    transcript to decide whether a directory is a session at all, so a listed
+    session has been stat-ed once per poll before this function is reached, and
+    stat-ing it again is pure repetition: 200 of a cold build's 1204 stats at
+    n=200, on every poll, warm or cold. The key is still computed HERE and only
+    here, from that ``os.stat_result``, so the key has one definition rather than
+    two spellings that can drift.
+
+    The lifetime this relies on is the scan's own call: the map is filled by the
+    scan and consumed by the build that follows it, in the same thread, so an
+    entry can never be older than the reader's own scan — a later scan replaces
+    it with a newer one, and a newer key costs a cache MISS (a row rebuilt from
+    disk), never a stale hit. A transcript appended between the scan and this
+    call is therefore served from the previous build for at most one poll, which
+    is the window the row cache already accepts; the next scan's key differs and
+    the row is rebuilt. See ``_scan_sessions``'s ``transcript_stats`` note.
     """
+    if known is not None:
+        return (known.st_mtime, known.st_size)
     from local_operator.session.retention import TRANSCRIPT_FILENAME
 
     try:
@@ -1017,6 +1039,8 @@ def cached_session_rows(
     *,
     candidates: list[tuple[str, float, str, bool]] | None = None,
     include_archived: bool = False,
+    transcript_stats: Mapping[str, os.stat_result] | None = None,
+    births: Mapping[str, float] | None = None,
 ) -> list[SessionRow]:
     """:func:`recent_session_rows` for the poll, memoized on transcript stat.
 
@@ -1031,6 +1055,17 @@ def cached_session_rows(
     one, so ranking and visibility stay identical to ``/resume``. Rows absent
     from the current answer are dropped, keeping the cache bounded by the live
     store rather than by every session ever listed.
+
+    ``transcript_stats`` and ``births`` are what the CALLER has already paid for,
+    both keyword-only and both defaulted to the behaviour every existing caller
+    has (stat the transcript, ask the birth memo). ``transcript_stats`` is
+    ``resume._scan_sessions``'s own record of the transcript it stat-ed to rank
+    each candidate — see :func:`_row_stat_key`, which is where the key is still
+    computed — and ``births`` is the ``created_at`` ``load_catalog`` stamped on
+    every candidate before ranking, so hydrating a row does not re-ask the birth
+    memo for an answer the same build already holds. Neither changes WHICH rows
+    are built or what they say: both only remove a syscall, and a value that is
+    absent from either map falls back to the stat/read it replaced.
     """
     from local_operator.resume import (
         ORIGIN_AGENT_WORKSTREAM,
@@ -1064,7 +1099,9 @@ def cached_session_rows(
     root = (directory / "sessions").resolve()
     for session_id, mtime, origin, archived in selected:
         session_dir = directory / "sessions" / session_id
-        key = _row_stat_key(session_dir)
+        key = _row_stat_key(
+            session_dir, transcript_stats.get(session_id) if transcript_stats else None
+        )
         cached = _ROW_CACHE.get(root / session_id)
         if key is not None and cached is not None and cached[0] == key:
             # Same transcript bytes as last poll: the name and the fork mark
@@ -1088,7 +1125,15 @@ def cached_session_rows(
                 forked=origin == ORIGIN_FORK and wears_inherited_title(session_dir),
                 # Through the memo ``load_catalog`` has just filled, so hydrating
                 # a page row does not read its birth a second time on a cold call.
-                created_at=_memoized_birth(directory / "sessions", session_id),
+                # A caller that already HAS the stamped birth (``load_catalog``,
+                # for every candidate) hands it over instead and the memo's key
+                # stat is not paid again; a caller that does not takes the memo's
+                # own answer, exactly as before.
+                created_at=(
+                    births[session_id]
+                    if births is not None and session_id in births
+                    else _memoized_birth(directory / "sessions", session_id)
+                ),
                 archived=archived,
                 # Gated on the origin the scan already parsed, like the fork
                 # probe above. The `_replace` on the cache-hit path carries the
@@ -1129,14 +1174,30 @@ def _subagent_marker(session_dir: Path) -> tuple[str, str]:
     return (values[0], values[1])
 
 
-def subagent_population(directory: Path) -> int:
+def subagent_population(directory: Path, *, known: int | None = None) -> int:
     """How many hidden subagent runs the store holds — the footer chip's count.
 
-    A full second scan of the store: ``_scan_sessions`` is not memoized, so
-    this costs about as much as ``load_catalog`` itself (+2.36 ms measured on a
-    156-visible/462-hidden store). Call it on a slow cadence — the sidebar
-    reads it on open and then every fifteenth poll — never once per poll.
+    ``known`` is that count when the caller ALREADY has it: the second value of
+    :func:`load_catalog_with_population`, which is ``len(hidden)`` from the scan
+    that built the page the caller is showing. With it, this function answers
+    from the caller's own scan and touches the filesystem not at all.
+
+    WITHOUT it this is a full second scan of the store — ``_scan_sessions`` is
+    not memoized — costing about as much as ``load_catalog``'s own scan
+    (+7.29 ms CPU, +1 ``scandir``, +601 ``stat`` measured at n = 200 visible /
+    2,000 hidden). That is why the one caller that renders the count gets it from
+    the catalogue build rather than asking here, and why this remains callable
+    the old way for a caller that has no page (and should stay on a slow cadence:
+    the sidebar reads it on open and then every fifteenth poll, never once per
+    poll).
+
+    The count is not a cached fact and is not kept in step with anything: it is
+    the SAME set the scan returned as ``hidden``, so there is no second source of
+    truth for it to disagree with. It is never truncated by ``limit`` — see
+    ``_scan_sessions``: a hidden set describes the store, not the page.
     """
+    if known is not None:
+        return known
     from local_operator.resume import _scan_sessions
 
     return len(_scan_sessions(directory)[1])
@@ -1151,7 +1212,47 @@ def load_catalog(
     pinned_hidden_ids: Sequence[str] = (),
     pinned_off_page: Sequence[str] = (),
 ) -> list[CatalogEntry]:
+    """The ranked page alone; see :func:`load_catalog_with_population` for the work.
+
+    Kept as the shape every existing caller already has — the desktop route, the
+    phone's surfaces and the TUI extensions all want rows and nothing else — and
+    implemented as a projection of the one function that does the build, so the
+    two cannot drift: there is exactly one place that scans, ranks, decorates and
+    hydrates, and this is not a second one.
+    """
+    return load_catalog_with_population(
+        directory,
+        limit,
+        include_subagents=include_subagents,
+        include_archived=include_archived,
+        pinned_hidden_ids=pinned_hidden_ids,
+        pinned_off_page=pinned_off_page,
+    )[0]
+
+
+def load_catalog_with_population(
+    directory: Path,
+    limit: int = CATALOG_SCAN_LIMIT,
+    *,
+    include_subagents: bool = False,
+    include_archived: bool = False,
+    pinned_hidden_ids: Sequence[str] = (),
+    pinned_off_page: Sequence[str] = (),
+) -> tuple[list[CatalogEntry], int]:
     """Rank a shared lightweight candidate snapshot before materializing a page.
+
+    Returns ``(page, hidden_population)``. The SECOND value is ``len(hidden)``
+    from the scan this build already ran, and it is here rather than left to a
+    second call because :func:`subagent_population` answers that question by
+    scanning the whole store again (+7.29 ms CPU, +1 ``scandir``, +601 ``stat``
+    at n = 200 visible / 2,000 hidden) — and the caller that needs it (the TUI
+    sidebar's footer chip) runs inside the SAME ``collect()`` as this build, on
+    the very path a sidebar open takes in full. Publishing the count with the
+    page removes that second scan without introducing a second source of truth:
+    it is the scan's own set, handed on, and the caller may pass it straight to
+    ``subagent_population(directory, known=...)`` or use it directly. A caller
+    that only wants rows calls :func:`load_catalog`, which is this function's
+    first value.
 
     Discovery already stats the whole namespace. Applying a recency cap before
     attention lost old unread work; reading names for the entire store would
@@ -1217,11 +1318,17 @@ def load_catalog(
     # what removes this function's own O(store) stat; see the desktop-probe loop
     # below for why a hidden directory cannot carry a desktop marker.
     #
+    # The third is the stat it took of each candidate's transcript to rank it,
+    # handed to ``cached_session_rows`` below so the row cache's key does not
+    # stat the same file a second time on every poll. See ``_row_stat_key``.
+    #
     # ``strict=True`` is this function's own declaration, not a global policy:
     # see the docstring above, and ``_scan_sessions`` for the boundary it draws
     # between a store that is not there (an empty listing, still) and a store
     # that cannot be read (an unavailable one).
-    candidates, hidden = _scan_sessions(directory, strict=True, include_archived=include_archived)
+    candidates, hidden, transcript_stats = _scan_sessions(
+        directory, strict=True, include_archived=include_archived
+    )
     source = {
         session_id: (session_id, mtime, origin, archived)
         for session_id, mtime, origin, archived in candidates
@@ -1324,6 +1431,14 @@ def load_catalog(
         )
         for session_id, mtime, _origin, archived in candidates
     ]
+    # The birth just stamped, keyed by id, for the hydration call at the end of
+    # this function — which rebuilds a row for every candidate whose transcript
+    # moved since the last poll and would otherwise ask ``_memoized_birth`` the
+    # same question a second time, paying its key stat (and, for a directory
+    # whose sidecar it cannot cache, its whole fallback read) again. Built from
+    # the list above rather than inside the comprehension so the map and the rows
+    # it describes cannot disagree: they are the same objects.
+    births = {row.id: row.created_at for row in rows}
     # One directory read plus a stat per unlisted candidate, NOT
     # ``glob("*/desktop.json")``. The glob looks equivalent and is not: a
     # pattern whose wildcard is a DIRECTORY component makes pathlib open and
@@ -1518,7 +1633,19 @@ def load_catalog(
     named = {
         row.id: row
         for row in cached_session_rows(
-            directory, candidates=[source[entry.id] for entry in entries if entry.id in source]
+            directory,
+            candidates=[source[entry.id] for entry in entries if entry.id in source],
+            # What this build already paid for: the scan's own transcript stat
+            # (the row cache's key) and the birth stamped above. A row whose
+            # transcript moved since the last poll is rebuilt here, and without
+            # these two maps that rebuild would stat the transcript a second
+            # time and re-ask the birth memo — the two per-session repeats this
+            # lane removes. Entries for ids in ``source`` that are NOT in
+            # ``births`` are the subagent layer's rows, which are stamped from
+            # ``session_created_at`` rather than through the memo; they fall
+            # back to it, exactly as before.
+            transcript_stats=transcript_stats,
+            births=births,
         )
     }
     return [
@@ -1545,4 +1672,4 @@ def load_catalog(
             else entry
         )
         for entry in entries
-    ]
+    ], len(hidden)

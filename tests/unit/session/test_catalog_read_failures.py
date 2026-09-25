@@ -198,9 +198,14 @@ def test_a_tolerant_caller_still_gets_the_empty_answer_and_a_warning(
     _failing_open(monkeypatch, store, OSError(errno.EACCES, "Permission denied"))
 
     with caplog.at_level(logging.WARNING, logger="local_operator.resume"):
-        rows, hidden = _scan_sessions(tmp_path)
+        # INDEXED, not unpacked. ``_scan_sessions`` returns ``(rows,
+        # hidden_names, transcript_stats)`` — the third element is the addition
+        # ``session/catalog.py``'s own caller unpacks — and this cell is about
+        # the first two. Naming the arity here made it fail on a shape change
+        # that is not its subject.
+        scan = _scan_sessions(tmp_path)
 
-    assert (rows, hidden) == ([], set())
+    assert (scan[0], scan[1]) == ([], set())
     assert any(record.levelno == logging.WARNING for record in caplog.records)
     assert "session store could not be read" in caplog.records[-1].getMessage()
 

@@ -1049,6 +1049,11 @@ _ALLOWED_ROWS: tuple[tuple[str | int, ...], ...] = (
         "temp FILE -> origin-verdicts.json",
     ),
     (
+        "local_operator/resume.py::_write_title_sweep_stamp",
+        "<path>.replace",
+        "temp FILE -> the title sweep's frontier under cache/ (config_dir, never a store)",
+    ),
+    (
         "local_operator/resume.py::_write_origin_scan_sentinel",
         "<path>.replace",
         "temp FILE -> sentinel in a session",
@@ -1736,6 +1741,9 @@ _NEAR_DISPLACERS: frozenset[str] = frozenset(
         "local_operator/resume.py::_write_origin_scan_sentinel",  # tmp -> origin-scan.json
         "local_operator/resume.py::_write_title_scan_sentinel",  # tmp -> title-scan.json
         "local_operator/resume.py::_save_origin_cache",  # tmp -> origin cache FILE
+        # tmp -> the title sweep frontier, under config_dir/cache (derived data,
+        # never a session directory: title_sweep_stamp_path joins cache/)
+        "local_operator/resume.py::_write_title_sweep_stamp",
         "local_operator/session/cleanup.py::_write_record",  # tmp -> last-cleanup.json
         # tmp -> update-window.json (the update window's handover marker)
         "local_operator/session/runtime/inbox.py::write_update_window",

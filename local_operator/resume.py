@@ -1010,72 +1010,47 @@ def backfill_session_origins(config_dir: Path, limit: int = 500) -> int:
     origin by where its random name falls in an alphabet is not a policy
     anyone would choose deliberately.
 
-    WHERE THE DIRECTORY LIST COMES FROM, and why that is the whole of this
-    lane's change here. It used to be ``sorted(sessions.iterdir())``: every
-    directory in the store, each paying ``transcript.is_file()``,
-    ``origin.json.exists()`` and the sentinel's ``exists()`` before the sweep
-    could conclude it had nothing to say. On a store of the reporting machine's
-    shape that is ~11.5k directories and ~17.6k syscalls for a pass that stamps
-    nothing, re-paid every host minute by every runtime's maintenance thread.
-
-    :func:`_scan_sessions` already answers the two questions that decide whether
-    a directory can possibly be a candidate — "does it have a transcript" and
-    "does it carry an origin marker" — for the whole store, and it answers the
-    dominant one for FREE: a directory the verdict cache knows is hidden is
-    skipped whole from the ``readdir`` batch, so the ~93% of a real store that
-    is delegated runs costs this pass zero syscalls. What is left is the user's
-    own sessions, which is the population the sweep is actually about, and the
-    directories that are neither listed nor cached-hidden (never active, no
-    marker) drop out too — the old walk paid a stat for each of them.
-
-    The candidate set is therefore ``rows`` with an empty ``origin`` (a readable
-    marker means the question is already answered), taken in NAME order because
-    that order is what decides WHICH directories a run bounded by ``limit``
-    answers — see the paragraph above. The three existence checks are still made
-    against the filesystem rather than carried out of the projection, and one of
-    them is load-bearing: a row with ``origin == ""`` is either a directory with
-    NO marker or one whose marker exists but would not parse, and the second
-    must be skipped exactly as before (a corrupt marker deliberately reads as
-    the user's own session, so re-stamping it would hide a row the fail-safe
-    keeps visible). The projection cannot tell those apart, and one stat per
-    USER session is a cheap way not to widen the scan's return shape — which
-    every other caller unpacks — for it.
+    WHY THIS ONE STILL WALKS THE STORE, unlike the title sweep beside it. Its
+    sibling :func:`backfill_session_titles` is driven by the picker's
+    projection, and that is a real win there (504 -> 78 ms CPU per cycle). The
+    same change was applied HERE and reverted, because the projection cannot
+    answer this sweep's question in principle rather than by degree:
+    :func:`_scan_sessions` EXCLUDES the hidden and subagent population — that
+    exclusion is exactly what makes it cheap — and a marked child directory IS
+    that population. So the rows it returns are the ones this sweep has nothing
+    to say about, and the rows it must stamp are the ones missing from them.
+    The failure is not a smaller candidate set but an EMPTY one, and it is
+    silent: the sweep returns 0, the picker keeps its stale rows, and nothing
+    raises. Pinned by
+    ``test_the_backfill_stamps_only_what_the_machine_itself_wrote``, whose third
+    assertion — a marker deleted by hand must be re-stamped — returned 0 where
+    it must return 1.
     """
     stamped = 0
     sessions = config_dir / "sessions"
-    # ``strict`` is left OFF deliberately: this is a best-effort startup pass,
-    # and a store that cannot be walked must cost it nothing, which is what the
-    # old ``except OSError: return 0`` promised.
-    rows = _scan_sessions(config_dir, include_archived=True)[0]
-    for name, _activity, origin, _archived in sorted(rows, key=lambda row: row[0]):
-        if origin:
-            # A readable marker: answered, and the sweep must never re-stamp it.
-            continue
+    try:
+        directories = sorted(sessions.iterdir())
+    except OSError:
+        return 0
+    for directory in directories:
         if stamped >= limit:
             break
-        directory = sessions / name
         try:
-            # The ANSWER first, then the questions that decide whether this
-            # directory is one the pass has anything to say about. The order is
-            # free — the three are existence tests and the outcome is their
-            # conjunction — so the one that is already true of almost every
-            # candidate in a steady store is asked first and a directory a
-            # previous run answered costs ONE stat.
-            #
-            # This pass's OWN "considered and not a subagent" marker — not the
-            # title sweep's sentinel. The two sweeps traverse independently and
-            # THIS one stops at ``limit`` stamps, so a title sentinel written
-            # for a directory this pass never reached would suppress the origin
-            # question forever (the 501st stampable subagent behind a >500
-            # backlog, permanently unmarked). A marker only this pass writes can
-            # only exist for a directory this pass genuinely visited.
-            if (directory / ORIGIN_SCAN_SENTINEL_NAME).exists():
+            if not (directory / TRANSCRIPT_NAME).is_file():
                 continue
             # Already answered: never re-stamp, so a marker a user removed by
             # hand to un-hide a session is not silently written back.
             if (directory / ORIGIN_NAME).exists():
                 continue
-            if not (directory / TRANSCRIPT_NAME).is_file():
+            # This pass's OWN "considered and not a subagent" marker — not
+            # the title sweep's sentinel. The two sweeps traverse
+            # independently and THIS one stops at ``limit`` stamps, so a
+            # title sentinel written for a directory this pass never reached
+            # would suppress the origin question forever (the 501st
+            # stampable subagent behind a >500 backlog, permanently
+            # unmarked). A marker only this pass writes can only exist for
+            # a directory this pass genuinely visited.
+            if (directory / ORIGIN_SCAN_SENTINEL_NAME).exists():
                 continue
         except OSError:
             continue
@@ -1093,6 +1068,7 @@ def backfill_session_origins(config_dir: Path, limit: int = 500) -> int:
             # opener read, never a lost session.
             _write_origin_scan_sentinel(directory)
     return stamped
+
 
 
 def _scan_all_titles(transcript: Path) -> list[tuple[str, bool]]:

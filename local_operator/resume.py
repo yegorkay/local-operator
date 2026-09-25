@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -1008,32 +1009,73 @@ def backfill_session_origins(config_dir: Path, limit: int = 500) -> int:
     the cut stamped 0 on three consecutive startups. Deciding a session's
     origin by where its random name falls in an alphabet is not a policy
     anyone would choose deliberately.
+
+    WHERE THE DIRECTORY LIST COMES FROM, and why that is the whole of this
+    lane's change here. It used to be ``sorted(sessions.iterdir())``: every
+    directory in the store, each paying ``transcript.is_file()``,
+    ``origin.json.exists()`` and the sentinel's ``exists()`` before the sweep
+    could conclude it had nothing to say. On a store of the reporting machine's
+    shape that is ~11.5k directories and ~17.6k syscalls for a pass that stamps
+    nothing, re-paid every host minute by every runtime's maintenance thread.
+
+    :func:`_scan_sessions` already answers the two questions that decide whether
+    a directory can possibly be a candidate — "does it have a transcript" and
+    "does it carry an origin marker" — for the whole store, and it answers the
+    dominant one for FREE: a directory the verdict cache knows is hidden is
+    skipped whole from the ``readdir`` batch, so the ~93% of a real store that
+    is delegated runs costs this pass zero syscalls. What is left is the user's
+    own sessions, which is the population the sweep is actually about, and the
+    directories that are neither listed nor cached-hidden (never active, no
+    marker) drop out too — the old walk paid a stat for each of them.
+
+    The candidate set is therefore ``rows`` with an empty ``origin`` (a readable
+    marker means the question is already answered), taken in NAME order because
+    that order is what decides WHICH directories a run bounded by ``limit``
+    answers — see the paragraph above. The three existence checks are still made
+    against the filesystem rather than carried out of the projection, and one of
+    them is load-bearing: a row with ``origin == ""`` is either a directory with
+    NO marker or one whose marker exists but would not parse, and the second
+    must be skipped exactly as before (a corrupt marker deliberately reads as
+    the user's own session, so re-stamping it would hide a row the fail-safe
+    keeps visible). The projection cannot tell those apart, and one stat per
+    USER session is a cheap way not to widen the scan's return shape — which
+    every other caller unpacks — for it.
     """
     stamped = 0
     sessions = config_dir / "sessions"
-    try:
-        directories = sorted(sessions.iterdir())
-    except OSError:
-        return 0
-    for directory in directories:
+    # ``strict`` is left OFF deliberately: this is a best-effort startup pass,
+    # and a store that cannot be walked must cost it nothing, which is what the
+    # old ``except OSError: return 0`` promised.
+    rows = _scan_sessions(config_dir, include_archived=True)[0]
+    for name, _activity, origin, _archived in sorted(rows, key=lambda row: row[0]):
+        if origin:
+            # A readable marker: answered, and the sweep must never re-stamp it.
+            continue
         if stamped >= limit:
             break
+        directory = sessions / name
         try:
-            if not (directory / TRANSCRIPT_NAME).is_file():
+            # The ANSWER first, then the questions that decide whether this
+            # directory is one the pass has anything to say about. The order is
+            # free — the three are existence tests and the outcome is their
+            # conjunction — so the one that is already true of almost every
+            # candidate in a steady store is asked first and a directory a
+            # previous run answered costs ONE stat.
+            #
+            # This pass's OWN "considered and not a subagent" marker — not the
+            # title sweep's sentinel. The two sweeps traverse independently and
+            # THIS one stops at ``limit`` stamps, so a title sentinel written
+            # for a directory this pass never reached would suppress the origin
+            # question forever (the 501st stampable subagent behind a >500
+            # backlog, permanently unmarked). A marker only this pass writes can
+            # only exist for a directory this pass genuinely visited.
+            if (directory / ORIGIN_SCAN_SENTINEL_NAME).exists():
                 continue
             # Already answered: never re-stamp, so a marker a user removed by
             # hand to un-hide a session is not silently written back.
             if (directory / ORIGIN_NAME).exists():
                 continue
-            # This pass's OWN "considered and not a subagent" marker — not
-            # the title sweep's sentinel. The two sweeps traverse
-            # independently and THIS one stops at ``limit`` stamps, so a
-            # title sentinel written for a directory this pass never reached
-            # would suppress the origin question forever (the 501st
-            # stampable subagent behind a >500 backlog, permanently
-            # unmarked). A marker only this pass writes can only exist for
-            # a directory this pass genuinely visited.
-            if (directory / ORIGIN_SCAN_SENTINEL_NAME).exists():
+            if not (directory / TRANSCRIPT_NAME).is_file():
                 continue
         except OSError:
             continue
@@ -1148,9 +1190,123 @@ def _write_title_scan_sentinel(session_dir: Path) -> None:
         return
 
 
+#: How old a directory must be, relative to the title sweep's frontier, before
+#: the frontier is trusted to answer for it.
+#:
+#: A GUARD BAND, not a tuning knob. The frontier is a wall-clock instant and a
+#: directory's ``st_mtime_ns`` is a filesystem timestamp, and the two can
+#: disagree in the direction that loses a sweep: a filesystem with one-second
+#: granularity (some ext4 mounts) reports an mtime truncated DOWNWARD, so a
+#: directory created just after the pass started could carry a stamp below it —
+#: and would then be treated as answered when nothing had looked at it. Two
+#: seconds covers that granularity plus ordinary clock skew; the cost is that
+#: directories touched in the two seconds before a pass are re-probed, which on
+#: a store of any size is a handful of stats.
+TITLE_SWEEP_GUARD_NS = 2_000_000_000
+
+#: ``cache/`` record of how far the title sweep has verified the store.
+#:
+#: WHY A SECOND KIND OF CACHE IS NEEDED HERE, and why the scan's projection
+#: cannot do this job. ``_scan_sessions`` answers "does this directory carry an
+#: origin marker" — which is the whole of the origin sweep's question — but the
+#: title sweep's question is different in kind: "has this directory already been
+#: answered for titles?", whose answer lives in the per-directory sidecar or
+#: sentinel this sweep writes. Carrying THAT in the projection would mean
+#: stat-ing two more names per directory inside the 2-second catalogue poll,
+#: which is exactly the per-hidden-directory cost the poll exists not to pay; so
+#: the title sweep gets a store-level record of its own instead.
+#:
+#: WHAT IT RECORDS: the wall-clock instant a pass STARTED, and only for a pass
+#: that ran to completion over the whole store (see the sweep for the three ways
+#: a pass is incomplete). A directory is then answered without being looked at
+#: when its own mtime is older than that instant.
+#:
+#: WHY THAT IS SOUND, in both directions. A completed pass ANSWERS every
+#: directory that has a transcript: it writes a sidecar when it finds a
+#: journalled title and a sentinel when it finds none, and those are the only
+#: two outcomes for such a directory. A directory it skipped had no transcript
+#: at that instant, and a transcript appearing later CREATES AN ENTRY in the
+#: directory, which moves the directory's own mtime — the thing this check
+#: reads. In the other direction, the only way a directory becomes un-answered
+#: is the removal of its sidecar and sentinel, which is also an entry removal
+#: and therefore also moves that mtime. So "older than the frontier" and
+#: "answered" cannot come apart without something moving the mtime, which is
+#: what makes this a cache of the sentinels rather than a second source of truth
+#: beside them: the sentinels are still written, still read by nothing else, and
+#: still the durable per-directory record.
+#:
+#: WHAT IT DOES NOT COVER, stated rather than elided: a directory whose mtime is
+#: moved BACKWARDS below the frontier (a restore that preserves timestamps while
+#: omitting the answer files) is not re-probed. That is the same class of
+#: accepted staleness ``ORIGIN_CACHE_NAME`` documents for a hand-deleted marker,
+#: and the same remedy applies — this file is derived data under ``cache/``, so
+#: deleting it forces the full pass.
+TITLE_SWEEP_STAMP_NAME = "title-sweep.json"
+
+#: Bumped when the stamp's shape changes, so an older file is discarded rather
+#: than misread. Same mechanism as :data:`ORIGIN_CACHE_VERSION`.
+TITLE_SWEEP_STAMP_VERSION = 1
+
+
+def title_sweep_stamp_path(config_dir: Path) -> Path:
+    """Where the title sweep's completion frontier lives.
+
+    Under ``cache/`` beside the origin-verdict cache: both are derived data a
+    user may delete at any time to force a rebuild, and neither is a source of
+    truth.
+    """
+    return config_dir / "cache" / TITLE_SWEEP_STAMP_NAME
+
+
+def _read_title_sweep_stamp(config_dir: Path) -> int | None:
+    """The frontier in nanoseconds since the epoch, or ``None`` for "no stamp".
+
+    Every failure — absent, torn, unparseable, an unknown version, a bool, a
+    non-integer, a non-positive value — yields ``None``, which means the FULL
+    pass: the cost this sweep paid before the frontier existed. A cache that
+    cannot be read must cost work, never an answer.
+    """
+    try:
+        raw = title_sweep_stamp_path(config_dir).read_text(encoding="utf-8", errors="replace")
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or payload.get("version") != TITLE_SWEEP_STAMP_VERSION:
+            return None
+        stamp = payload.get("completed_at_ns")
+    except (OSError, ValueError):
+        return None
+    if isinstance(stamp, bool) or not isinstance(stamp, int) or stamp <= 0:
+        return None
+    return stamp
+
+
+def _write_title_sweep_stamp(config_dir: Path, completed_at_ns: int) -> None:
+    """Persist the frontier, best-effort and atomically.
+
+    Atomic with a PID-suffixed temp for :func:`_save_origin_cache`'s reason:
+    several runtimes run this pass at once, and a fixed temp name lets one
+    process ``replace`` a document another is still filling. A torn document is
+    discarded by the loader, so the bound is a needless full pass.
+    """
+    try:
+        path = title_sweep_stamp_path(config_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "version": TITLE_SWEEP_STAMP_VERSION,
+                    "completed_at_ns": completed_at_ns,
+                }
+            ),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except OSError:
+        return
+
+
 def backfill_session_titles(config_dir: Path, limit: int = 500) -> int:
     """Write the title sidecar for sessions that predate it, and return how many.
-
     Mirrors :func:`backfill_session_origins` exactly, and for the same reason:
     without it the sidecar fix only applies to sessions renamed AFTER the
     upgrade, so the person who reported being unable to find a topic-pivot
@@ -1187,20 +1343,69 @@ def backfill_session_titles(config_dir: Path, limit: int = 500) -> int:
     list instead would leave any session sorting past the cut unvisited on
     every run forever, because the list sorts by hex name and the same prefix
     is recomputed each startup.
+
+    THE FRONTIER, which is this sweep's half of the lane. On the reporting
+    machine this pass cost 318.8 ms CPU per cycle for a store whose answers had
+    all been written long ago: every directory paid ``transcript.is_file()``,
+    ``title.json.exists()`` and ``title-scan.json.exists()``, forever, to
+    re-confirm a fact that only changes when the directory's CONTENTS change.
+    :data:`TITLE_SWEEP_STAMP_NAME` records how far a COMPLETED pass has verified
+    the store, so a directory older than that frontier is answered by ONE stat
+    against the directory itself. The reasoning that makes that equivalent — and
+    the one shape it does not cover — is on the constant.
+
+    A pass advances the frontier only when it is COMPLETE, and there are four
+    ways it is not: ``limit`` cut the work short, a directory could not be
+    stat-ed, an answer could not be WRITTEN (a store that has gone read-only
+    must not be recorded as swept, or the next writable pass would never
+    revisit it), or the process left mid-pass. An incomplete pass leaves the old
+    frontier exactly where it was, so the next one re-runs the same window
+    rather than declaring it done — the same direction
+    ``analytics.backfill``'s rollup frontier takes when a day fails.
+
+    The stamp is the pass's own START, read before the first directory: a
+    session created while the pass is walking must be re-probed by the next one,
+    and a stamp taken at the END would claim it. A stamp from the FUTURE (the
+    clock stepped backwards since it was written) is discarded rather than
+    trusted, because every directory created in the interval would carry an
+    mtime below it; a forward step merely costs a pass that re-probes more.
     """
     written = 0
     sessions = config_dir / "sessions"
+    started_ns = time.time_ns()
+    frontier = _read_title_sweep_stamp(config_dir)
+    if frontier is not None and started_ns < frontier:
+        frontier = None
+    complete = True
     try:
-        directories = sorted(sessions.iterdir())
+        # One ``scandir``, and the entries are sorted by NAME as before: that
+        # order is what decides which directories a run bounded by ``limit``
+        # answers, so it must not become a property of the filesystem's readdir
+        # order.
+        with os.scandir(sessions) as scan:
+            entries = sorted(scan, key=lambda entry: entry.name)
     except OSError:
         return 0
-    for directory in directories:
+    for entry in entries:
         if written >= limit:
+            complete = False
             break
+        directory = Path(entry.path)
         try:
-            transcript = directory / TRANSCRIPT_NAME
-            if not transcript.is_file():
+            # THE FRONTIER, first because it is the question a steady store has
+            # already answered: ONE stat against the directory, and nothing is
+            # read, opened or stat-ed inside it.
+            if (
+                frontier is not None
+                and os.stat(entry.path).st_mtime_ns + TITLE_SWEEP_GUARD_NS < frontier
+            ):
                 continue
+            # The answer next, then the questions that decide whether there is
+            # work here at all. The order is free — existence tests whose
+            # outcome is their conjunction — so the one that is true of almost
+            # every directory in a steady store (and of every directory the pass
+            # itself just answered) is asked first.
+            #
             # Already answered: never re-stamp. The sidecar is event-sourced
             # from here on, so a rewrite would only risk clobbering a newer
             # sidecar with an older full scan on a session that has since been
@@ -1210,7 +1415,15 @@ def backfill_session_titles(config_dir: Path, limit: int = 500) -> int:
                 continue
             if (directory / TITLE_SCAN_SENTINEL_NAME).exists():
                 continue
+            transcript = directory / TRANSCRIPT_NAME
+            if not transcript.is_file():
+                continue
         except OSError:
+            # A directory this pass could not vouch for: it may not be recorded
+            # as swept. The loop goes on (the old contract -- one unreadable
+            # directory must not cost the sweep the rest of the store) and the
+            # frontier stays where it was.
+            complete = False
             continue
         titles = _scan_all_titles(transcript)
         if not titles:
@@ -1220,11 +1433,20 @@ def backfill_session_titles(config_dir: Path, limit: int = 500) -> int:
             # is nothing to journal — but RECORD that the scan ran, so the next
             # boot does not pay for the same answer again.
             _write_title_scan_sentinel(directory)
+            if not (directory / TITLE_SCAN_SENTINEL_NAME).exists():
+                # The write failed (a read-only store, a vanished directory).
+                # Nothing is recorded here that the next writable pass would not
+                # revisit, so this pass may not claim the directory as answered.
+                complete = False
             continue
         past_names = [text for text, _ in titles]
         newest_text, newest_user_set = titles[-1]
         write_session_title(directory, newest_text, user_set=newest_user_set, past_names=past_names)
+        if not (directory / TITLE_SIDECAR_NAME).exists():
+            complete = False
         written += 1
+    if complete:
+        _write_title_sweep_stamp(config_dir, started_ns)
     return written
 
 
